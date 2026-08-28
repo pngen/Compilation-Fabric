@@ -11,6 +11,9 @@ This section records actual, proven limitations of Compilation Fabric 1.0.0.
   reproducibility; it records normalized reproducibility evidence and labels the
   exact limitation. The deterministic CPU backend and the Compilation Fabric
   artifact pipeline itself are deterministic.
+- **Benchmark coverage**: the measured benchmark matrix covers artifact pools of
+  1K/10K/100K, 1/4/8 threads, and 100%/90-10/50-50 hit/miss mixes (see
+  docs/benchmarks.md).
 - **Autotuning scope**: the bounded autotuner selects the best among the
   evaluated candidate variants and records exact evidence; it never claims global
   optimality.
