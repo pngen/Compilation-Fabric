@@ -627,6 +627,7 @@ Json CompilationFabric::stats() const {
     j.set("cache_entries", Json::number(static_cast<double>(i.cache.size())));
     size_t activeInflight = 0; for (auto& [k, e] : i.inflight) if (!e->done) { (void)k; ++activeInflight; }
     j.set("active_builds", Json::number(static_cast<double>(activeInflight)));
+    { std::lock_guard<std::mutex> ll(i.leaseMutex_); size_t leases=0; for (auto& [k,v] : i.leaseCounts) leases += v.size(); j.set("active_leases", Json::number(static_cast<double>(leases))); } j.set("active_reservations", Json::number(0.0));
     return j;
 }
 
