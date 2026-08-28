@@ -73,11 +73,11 @@ int main(int argc, char** argv) {
             return r.ok() ? 0 : 1;
         }
         if (cmd == "worker") {
-            if (argc < 4) { std::printf("usage: worker <host> <port> [cuda]\n"); return 1; }
+            if (argc < 4) { std::printf("usage: worker <host> <port> [id]\n"); return 1; }
             std::string host = argv[2];
             uint16_t port = static_cast<uint16_t>(std::atoi(argv[3]));
-            WorkerId id = (argc > 4 && std::string(argv[4]) == "cuda") ? 10 : static_cast<WorkerId>(Clock::monotonicNanos() % 1000);
-            bool cuda = argc > 4 && std::string(argv[4]) == "cuda";
+            WorkerId id = (argc > 4) ? static_cast<WorkerId>(std::atoi(argv[4])) : static_cast<WorkerId>(Clock::monotonicNanos() % 1000);
+            bool cuda = false;
             DistributedWorker w(host, port, id, cuda);
             return w.run();
         }

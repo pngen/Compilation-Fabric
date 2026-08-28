@@ -4,8 +4,7 @@ set(COMPILATION_FABRIC_TESTS
     concurrency
     persistence_recovery
     adversarial
-    property
-)
+    property)
 foreach(t ${COMPILATION_FABRIC_TESTS})
     add_executable(${t} ${t}.cpp)
     target_link_libraries(${t} PRIVATE CompilationFabric::CompilationFabric)

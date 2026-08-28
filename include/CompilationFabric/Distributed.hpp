@@ -89,6 +89,7 @@ public:
     Result<void> connect();
     Result<CompilationResult> submit(const CompilationRequest& req);
     Result<void> invalidate(const CompilationRequestId& id);
+    Result<Json> control(ControlKind kind);
     void close();
 private:
     std::string host_; uint16_t port_;

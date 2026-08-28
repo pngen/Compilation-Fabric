@@ -28,7 +28,7 @@ bool readEnvelope(CanonicalReader& r, ProtoEnvelope& e) {
     e = *dec; return true;
 }
 bool isValidType(uint32_t t) {
-    return t >= static_cast<uint32_t>(MsgType::Register) && t <= static_cast<uint32_t>(MsgType::Shutdown);
+    return t >= static_cast<uint32_t>(MsgType::Register) && t <= static_cast<uint32_t>(MsgType::Control);
 }
 } // namespace
 
@@ -45,6 +45,7 @@ std::string_view msgTypeName(MsgType t) {
         case MsgType::Heartbeat: return "Heartbeat";
         case MsgType::Shutdown: return "Shutdown";
         case MsgType::Reject: return "Reject";
+        case MsgType::Control: return "Control";
     }
     return "Unknown";
 }
@@ -251,6 +252,11 @@ ErrorCode decodeRejectCode(const std::vector<uint8_t>& payload) {
     uint32_t c; if (!r.u32(c)) return ErrorCode::MalformedFrame;
     return static_cast<ErrorCode>(c);
 }
+
+std::vector<uint8_t> encodeControl(ControlKind kind) { CanonicalWriter w; w.u32(static_cast<uint32_t>(kind)); return w.take(); }
+ControlKind decodeControl(const std::vector<uint8_t>& payload) { CanonicalReader r(std::string_view(reinterpret_cast<const char*>(payload.data()), payload.size())); uint32_t k; if (!r.u32(k)) return ControlKind::Ping; return static_cast<ControlKind>(k); }
+std::vector<uint8_t> encodeControlReply(const std::string& json) { CanonicalWriter w; w.string(json); return w.take(); }
+Result<std::string> decodeControlReply(const std::vector<uint8_t>& payload) { CanonicalReader r(std::string_view(reinterpret_cast<const char*>(payload.data()), payload.size())); std::string s; if (!r.str(s)) return Err<std::string>(ErrorCode::MalformedFrame, "bad control reply"); return Ok(s); }
 
 // ---------------------------------------------------------------------------
 // TCP

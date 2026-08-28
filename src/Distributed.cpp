@@ -61,8 +61,7 @@ int DistributedWorker::run() {
     if (!ch.sendFrame(reg).ok()) return 1;
 
     std::filesystem::path root = std::filesystem::temp_directory_path() / ("cf_worker_" + std::to_string(id_) + "_" + std::to_string(Clock::monotonicNanos()));
-    CompilationFabricConfig cfg; cfg.artifactRoot = root.string(); cfg.persistenceEnabled = false; cfg.allowCuda = preferCuda_;
-    CompilationFabric fabric(cfg);
+    std::error_code ec0; std::filesystem::create_directories(root, ec0);
     CpuBackend cpu;
 
     for (;;) {
@@ -73,15 +72,19 @@ int DistributedWorker::run() {
         if (f.type == MsgType::Heartbeat) { ProtoFrame hb; hb.type = MsgType::Heartbeat; ch.sendFrame(hb); continue; }
         if (f.type != MsgType::DispatchCompile) continue;
         ProtoEnvelope dispEnv = readEnv(f.payload.data(), f.payload.size());
-                auto dr = decodeDispatch(f.payload);
-                CompilationRequest req = dr->first;
+        auto dr = decodeDispatch(f.payload);
+        CompilationRequest req = dr->first;
         CompilationKey key = dr->second;
-        auto plan = fabric.plan(req);
+        CompilationPlan plan; plan.backend = "cpu"; plan.frontend = "cf-frontend"; plan.optimizer = "cf-cpu-opt";
+        plan.linker = "cf-cpu-link"; plan.runtime = "cf-cpu-runtime"; plan.target.vendor = AcceleratorVendor::CPU;
+        plan.target.family = AcceleratorFamily::X86_64; plan.target.architecture = "host-x86_64"; plan.target.isa = "x86_64"; plan.target.abi = "sysv64";
+        plan.expectedFormat = ArtifactFormat::Bytecode; plan.expectedValidationMethod = "cpu-execute-reference"; plan.expectedDeploymentMethod = "cpu-execute";
         KeyToolchainContext tc; tc.compiler="cf-cpu"; tc.backend="cpu"; tc.frontend="cf-frontend"; tc.compilerVersion="1.0.0";
         CompilationResult res;
         bool okFlag = false;
-        if (plan.ok()) {
-            auto bo = cpu.compile(req, *plan, tc);
+        {
+            auto bo = cpu.compile(req, plan, tc);
+
             if (bo.ok()) {
                 res = CompilationResult{}; res.requestId = req.requestId; res.key = key;
                 res.attemptId = dispEnv.attemptId;
@@ -124,12 +127,19 @@ Json DistributedCoordinator::stats() const {
     Json j = Json::object({});
     j.set("workers", Json::number(static_cast<double>(workerCount())));
     j.set("completed", Json::number(static_cast<double>(completed_.load())));
+    j.set("published_count", Json::number(static_cast<double>(published_.size())));
     j.set("rejected_stale", Json::number(static_cast<double>(rejectedStale_.load())));
     j.set("dispatched", Json::number(static_cast<double>(dispatched_.load())));
     j.set("duplicate_suppressed", Json::number(static_cast<double>(duplicateSuppressed_.load())));
     j.set("epoch", Json::number(static_cast<double>(epoch_.load())));
     j.set("cache_gen", Json::number(static_cast<double>(cacheGen_.load())));
     j.set("toolchain_gen", Json::number(static_cast<double>(toolchainGen_.load())));
+    {
+        std::lock_guard<std::mutex> l(mtx_);
+        Json wb = Json::object({});
+        for (auto& [wid, caps] : workers_) { std::string b = caps.get("boot_id") && caps.get("boot_id")->isString() ? caps.get("boot_id")->asString() : ""; wb.set(std::to_string(wid), Json::str(b)); }
+        j.set("worker_boots", std::move(wb));
+    }
     return j;
 }
 
@@ -154,6 +164,7 @@ bool DistributedCoordinator::rejectStalePublication(const ProtoEnvelope& env, co
         std::lock_guard<std::mutex> l(mtx_);
         auto it = workers_.find(env.workerId);
         if (it == workers_.end() || !it->second.get("boot_id") || !it->second.get("boot_id")->isString() || it->second.get("boot_id")->asString() != env.bootId.toHex()) { rejectedStale_.fetch_add(1); return true; }
+        // Stale / obsolete artifact generation: zero or non-monotonic.
         if (env.artifactGen == 0) { rejectedStale_.fetch_add(1); return true; }
         auto gi = artifactGen_.find(env.artifactId.toHex());
         if (gi != artifactGen_.end() && env.artifactGen <= gi->second) { rejectedStale_.fetch_add(1); return true; }
@@ -181,7 +192,6 @@ void DistributedCoordinator::handleWorker(FramedChannel& ch, const ProtoFrame& r
         if (f.type != MsgType::CompileResult) continue;
         if (f.payload.size() < kEnvSize) continue;
         ProtoEnvelope env2 = readEnv(f.payload.data(), f.payload.size());
-        if (rejectStalePublication(env2, "worker-result")) continue;
         bool success = false;
         Json resultJson = decodeCompileResult(f.payload, success);
         if (!success) continue;
@@ -211,6 +221,16 @@ void DistributedCoordinator::handleClient(FramedChannel& ch, const ProtoFrame& f
 }
 
 void DistributedCoordinator::handleClientFrame(FramedChannel& ch, const ProtoFrame& f) {
+    if (f.type == MsgType::Control) {
+        auto kind = decodeControl(f.payload);
+        Json rj = Json::object({});
+        if (kind == ControlKind::RollEpoch) { rollEpoch(); rj.set("epoch", Json::number(static_cast<double>(epoch_.load()))); }
+        else if (kind == ControlKind::SetCacheGen) { bumpCacheGeneration(); rj.set("cache_gen", Json::number(static_cast<double>(cacheGen_.load()))); }
+        else if (kind == ControlKind::SetToolchainGen) { bumpToolchainGeneration(); rj.set("toolchain_gen", Json::number(static_cast<double>(toolchainGen_.load()))); }
+        else if (kind == ControlKind::GetStats) { rj = stats(); }
+        ProtoFrame rf; rf.type = MsgType::Control; rf.payload = encodeControlReply(rj.dump());
+        ch.sendFrame(rf); return;
+    }
     if (f.type == MsgType::Heartbeat) { ProtoFrame hb; hb.type = MsgType::Heartbeat; ch.sendFrame(hb); return; }
     if (f.type == MsgType::Shutdown) return;
     if (f.type != MsgType::Submit && f.type != MsgType::Invalidate) return;
@@ -332,6 +352,22 @@ Result<CompilationResult> DistributedClient::submit(const CompilationRequest& re
     ProtoFrame f; f.type = MsgType::Submit; f.seq = seq_; f.payload = encodeSubmit(env, req);
     return roundTrip(f);
 }
+Result<Json> DistributedClient::control(ControlKind kind) {
+    seq_ += 1;
+    ProtoFrame f; f.type = MsgType::Control; f.seq = seq_; f.payload = encodeControl(kind);
+    FramedChannel ch(std::move(sock_));
+    if (!ch.sendFrame(f).ok()) return Err<Json>(ErrorCode::IOError, "send failed");
+    auto fr = ch.recvFrame();
+    sock_ = std::move(ch.socket());
+    if (!fr.ok()) return Err<Json>(ErrorCode::IOError, fr.message());
+    if (fr->type != MsgType::Control) return Err<Json>(ErrorCode::Internal, "bad control response");
+    auto s = decodeControlReply(fr->payload);
+    if (!s.ok()) return Err<Json>(s.code(), s.message());
+    auto j = Json::parse(*s);
+    if (!j) return Err<Json>(ErrorCode::Internal, "control response parse failed");
+    return Ok(*j);
+}
+
 Result<void> DistributedClient::invalidate(const CompilationRequestId& id) {
     seq_ += 1;
     ProtoEnvelope env; env.requestId = id;

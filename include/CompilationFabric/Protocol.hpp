@@ -33,8 +33,17 @@ enum class MsgType : uint32_t {
     Heartbeat,               // keepalive
     Shutdown,
     Reject,                  // Coordinator -> sender (stale_epoch, stale_worker_boot, ...)
+    Control,                 // control-plane (roll epoch, stats)
 };
 std::string_view msgTypeName(MsgType t);
+
+// Control-plane messages (operator/test control), carried as a Control frame.
+enum class ControlKind : uint32_t { RollEpoch = 1, GetStats = 2, Ping = 3, SetCacheGen = 4, SetToolchainGen = 5 };
+std::vector<uint8_t> encodeControl(ControlKind kind);
+ControlKind decodeControl(const std::vector<uint8_t>& payload);
+std::vector<uint8_t> encodeControlReply(const std::string& json);
+Result<std::string> decodeControlReply(const std::vector<uint8_t>& payload);
+
 
 struct ProtoFrame {
     MsgType type = MsgType::Heartbeat;
