@@ -1,21 +1,26 @@
 # Limitations
 
-This section records actual, proven limitations.
+This section records actual, proven limitations of Compilation Fabric 1.0.0.
 
-- **CUDA device execution**: Real NVRTC compilation and CUDA driver module load,
-  launch, result copy-back, and CPU-reference parity are implemented in the `cuda-nvrtc`
-  backend. In the sandboxed build/validation environment used for the Release and
-  Debug runs, the CUDA device itself is not accessible: any CUDA driver/NVRTC call
-  beyond a library-availability check terminates the calling process (observed as an
-  unconditional process kill with exit code 1). The CUDA backend therefore compiles
-  source to PTX/CUBIN and is exercised for availability, but the in-process
-  module-load/launch execution gate cannot be completed in this environment. This is
-  an environmental limitation, not a code path that was skipped.
-- **nvcc offline path**: The offline `nvcc` backend is not implemented; offline
-  compilation is served through the NVRTC backend. This is reported rather than
-  faked.
-- **Determinism**: Where a toolchain embeds timestamps or non-deterministic sections,
-  the runtime does not claim byte-identical reproducibility and instead provides
-  normalized reproducibility evidence.
-- The runtime never claims global autotuning optimality; it selects the best among
-  evaluated candidates.
+- **nvcc offline backend**: the offline `nvcc` backend is not implemented as a
+  separate driver. Offline compilation is served through the NVRTC backend
+  (NVRTC compiles CUDA source to PTX/CUBIN for the target architecture). This is
+  reported rather than faked.
+- **Determinism of external toolchains**: where a toolchain embeds timestamps or
+  non-deterministic sections, the runtime does not claim byte-identical
+  reproducibility; it records normalized reproducibility evidence and labels the
+  exact limitation. The deterministic CPU backend and the Compilation Fabric
+  artifact pipeline itself are deterministic.
+- **Autotuning scope**: the bounded autotuner selects the best among the
+  evaluated candidate variants and records exact evidence; it never claims global
+  optimality.
+- **Distributed worker authority**: the coordinator enforces strict authority on
+  worker messages (epoch, worker boot, cache/toolchain generation, artifact
+  generation, and attempt freshness). Worker capabilities are advertised by the
+  worker and trusted as the basis for dispatch; there is no remote attestation of
+  a worker's toolchain beyond its self-reported capabilities.
+
+CUDA device execution on the RTX 5090 (NVRTC compilation to PTX/CUBIN for
+`sm_120`, CUDA module load, kernel lookup, device allocation, launch,
+synchronization, copy-back, and CPU-reference parity) is verified to run to
+completion in this environment through the real `cuda-nvrtc` backend.

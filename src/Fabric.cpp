@@ -158,7 +158,10 @@ Result<CompilationPlan> CompilationFabric::plan(const CompilationRequest& reques
 
     // target
     if (backend == "cuda-nvrtc") {
-        if (!i.targets.empty()) p.target = i.targets.front();
+        // Prefer an advertised CUDA target when present; otherwise build one.
+        for (auto& tt : i.targets) if (tt.architecture == "sm_120" || tt.vendor == AcceleratorVendor::Nvidia) { p.target = tt; break; }
+        p.target.vendor = AcceleratorVendor::Nvidia;
+        p.target.family = AcceleratorFamily::NvidiaBlackwell;
         p.target.architecture = request.targetArchitecture.empty() ? "sm_120" : request.targetArchitecture;
         p.target.computeCapability = request.computeCapability.empty() ? "12.0" : request.computeCapability;
         p.target.isa = p.target.architecture;

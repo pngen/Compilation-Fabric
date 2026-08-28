@@ -195,7 +195,7 @@ void CudaApi::ensure() {
     n.getLogSize = (CudaApi::NvrtcGetSize)sym("nvrtcGetProgramLogSize");
     n.getProgramLog = (CudaApi::NvrtcGetLog)sym("nvrtcGetProgramLog");
     n.destroyProgram = (CudaApi::NvrtcDestroy)sym("nvrtcDestroyProgram");
-    n.getVersion = (CudaApi::NvrtcGetVersion)sym("nvrtcGetVersion");
+    n.getVersion = (CudaApi::NvrtcGetVersion)sym("nvrtcVersion");
     if (!n.createProgram || !n.compileProgram || !n.getLogSize || !n.getProgramLog) { impl_->error = "NVRTC symbols missing"; return; }
     int maj = 0, min = 0; if (n.getVersion) { n.getVersion(&maj, &min); impl_->nvrtcVersion = std::to_string(maj) + "." + std::to_string(min); }
 
@@ -224,6 +224,16 @@ void CudaApi::ensure() {
     if (!d.cuInit || !d.cuDeviceGetCount || !d.cuModuleLoadData || !d.cuLaunchKernel || !d.cuCtxSynchronize) { impl_->error = "CUDA driver symbols missing"; return; }
     int r = d.cuInit(0);
     if (r != CUDA_SUCCESS) { impl_->error = std::string("cuInit failed"); return; }
+    // Copy resolved entry points into the public class members that the backend calls.
+    createProgram = n.createProgram; compileProgram = n.compileProgram;
+    getPTXSize = n.getPTXSize; getPTX = n.getPTX; getCUBINSize = n.getCUBINSize; getCUBIN = n.getCUBIN;
+    getLogSize = n.getLogSize; getProgramLog = n.getProgramLog; destroyProgram = n.destroyProgram; getVersion = n.getVersion;
+    cuInit = d.cuInit; cuDeviceGetCount = d.cuDeviceGetCount; cuDeviceGet = d.cuDeviceGet;
+    cuDeviceGetName = d.cuDeviceGetName; cuDeviceGetAttribute = d.cuDeviceGetAttribute; cuCtxCreate = d.cuCtxCreate;
+    cuModuleLoadData = d.cuModuleLoadData; cuModuleGetFunction = d.cuModuleGetFunction; cuMemAlloc = d.cuMemAlloc;
+    cuMemFree = d.cuMemFree; cuMemcpyHtoD = d.cuMemcpyHtoD; cuMemcpyDtoH = d.cuMemcpyDtoH; cuLaunchKernel = d.cuLaunchKernel;
+    cuCtxSynchronize = d.cuCtxSynchronize; cuModuleUnload = d.cuModuleUnload; cuCtxDestroy = d.cuCtxDestroy;
+    cuGetErrorString = d.cuGetErrorString; cuGetErrorName = d.cuGetErrorName;
     impl_->avail = true;
     impl_->driverVersion = "driver-present";
 }
@@ -282,6 +292,10 @@ Result<void> CudaBackend::checkCompatible(const CompilationPlan& plan) const {
     auto a = getApi();
     if (!a->available()) return ErrVoid(ErrorCode::NoToolchain, a->error());
     if (plan.target.vendor != AcceleratorVendor::Nvidia) return ErrVoid(ErrorCode::TargetUnsupported, "CUDA backend requires NVIDIA target");
+    std::string arch = plan.target.architecture.empty() ? plan.request.targetArchitecture : plan.target.architecture;
+    if (!arch.empty() && arch != "sm_120" && arch != "sm_121" && arch != "sm_100" && arch != "sm_110" && arch != "sm_103" && arch != "sm_90") {
+        return ErrVoid(ErrorCode::TargetUnsupported, "CUDA backend does not support architecture " + arch);
+    }
     return OkVoid();
 }
 
@@ -346,6 +360,7 @@ Result<BackendOutput> CudaBackend::compile(const CompilationRequest& request, co
     std::string src = generateKernel(spec);
     std::vector<const char*> opts = {"--gpu-architecture=sm_120", "--std=c++17", "-default-device"};
     void* progObj = nullptr;
+    std::fprintf(stderr, "%s\n", src.c_str());
     if (a->createProgram(&progObj, src.c_str(), "cf_kernel.cpp", 0, nullptr, nullptr) != NVRTC_SUCCESS)
         return Err<BackendOutput>(ErrorCode::BuildFailed, "nvrtcCreateProgram failed");
     auto cleanupProg = [&]{ if (progObj) { if (a->destroyProgram) a->destroyProgram(&progObj); progObj = nullptr; } };
@@ -408,7 +423,7 @@ Result<ValidationDescriptor> CudaBackend::validate(const ArtifactDescriptor& des
     size_t bytes = static_cast<size_t>(n) * (dt == Datatype::F64 ? 8 : 4);
 
     int dev = 0; if (a->cuDeviceGet(&dev, 0) != CUDA_SUCCESS) { vd.passed = false; vd.message = "cuDeviceGet"; return Ok(vd); }
-    void* ctx = nullptr; if (a->cuCtxCreate(&ctx, CU_CTX_SCHED_AUTO, dev) != CUDA_SUCCESS) { vd.passed = false; vd.message = "cuCtxCreate"; return Ok(vd); }
+    void* ctx = nullptr; if (a->cuCtxCreate(&ctx, nullptr, CU_CTX_SCHED_AUTO, dev) != CUDA_SUCCESS) { vd.passed = false; vd.message = "cuCtxCreate"; return Ok(vd); }
     void* module = nullptr; if (a->cuModuleLoadData(&module, executable.data()) != CUDA_SUCCESS) { a->cuCtxDestroy(ctx); vd.passed = false; vd.message = "cuModuleLoadData"; return Ok(vd); }
     void* func = nullptr; if (a->cuModuleGetFunction(&func, module, "cf_kernel") != CUDA_SUCCESS) { a->cuModuleUnload(module); a->cuCtxDestroy(ctx); vd.passed = false; vd.message = "cuModuleGetFunction"; return Ok(vd); }
 
@@ -431,7 +446,11 @@ Result<ValidationDescriptor> CudaBackend::validate(const ArtifactDescriptor& des
         blkX = static_cast<unsigned>(block); gridX = static_cast<unsigned>((n + block - 1) / block);
         gridY = 1; gridZ = 1; blkY = 1; blkZ = 1; sharedMem = 0;
     }
-    int result = a->cuLaunchKernel(func, gridX, gridY, gridZ, blkX, blkY, blkZ, sharedMem, nullptr, nullptr, nullptr);
+    // The kernel takes (const T* in, T* out, int n, T scalar); provide real arg pointers.
+    uint64_t dpIn = inBuf, dpOut = outBuf; int argN = (int)n;
+    double argScalarD = spec.scalar; float argScalarF = (float)spec.scalar;
+    void* kp[4]; kp[0] = &dpIn; kp[1] = &dpOut; kp[2] = &argN; kp[3] = (dt == Datatype::F64) ? (void*)&argScalarD : (void*)&argScalarF;
+    int result = a->cuLaunchKernel(func, gridX, gridY, gridZ, blkX, blkY, blkZ, sharedMem, nullptr, kp, nullptr);
     if (result == CUDA_SUCCESS) result = a->cuCtxSynchronize();
 
     bool success = (result == CUDA_SUCCESS);
@@ -464,7 +483,7 @@ Result<std::shared_ptr<LoadedModule>> CudaBackend::load(const ArtifactDescriptor
     auto a = getApi();
     if (!a->available()) return Err<std::shared_ptr<LoadedModule>>(ErrorCode::NoToolchain, a->error());
     int dev = 0; if (a->cuDeviceGet(&dev, 0) != CUDA_SUCCESS) return Err<std::shared_ptr<LoadedModule>>(ErrorCode::LoadFailed, "cuDeviceGet");
-    void* ctx = nullptr; if (a->cuCtxCreate(&ctx, CU_CTX_SCHED_AUTO, dev) != CUDA_SUCCESS) return Err<std::shared_ptr<LoadedModule>>(ErrorCode::LoadFailed, "cuCtxCreate");
+    void* ctx = nullptr; if (a->cuCtxCreate(&ctx, nullptr, CU_CTX_SCHED_AUTO, dev) != CUDA_SUCCESS) return Err<std::shared_ptr<LoadedModule>>(ErrorCode::LoadFailed, "cuCtxCreate");
     void* module = nullptr; if (a->cuModuleLoadData(&module, executable.data()) != CUDA_SUCCESS) { a->cuCtxDestroy(ctx); return Err<std::shared_ptr<LoadedModule>>(ErrorCode::LoadFailed, "cuModuleLoadData"); }
     void* func = nullptr; if (a->cuModuleGetFunction(&func, module, "cf_kernel") != CUDA_SUCCESS) { a->cuModuleUnload(module); a->cuCtxDestroy(ctx); return Err<std::shared_ptr<LoadedModule>>(ErrorCode::LoadFailed, "cuModuleGetFunction"); }
     uint64_t n = descriptor.specialization.shape.empty() ? 1024 : std::llabs(descriptor.specialization.shape.front());

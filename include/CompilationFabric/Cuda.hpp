@@ -43,10 +43,10 @@ public:
     using CuResult = int;
     using CuCuInit = CuResult(*)(unsigned int);
     using CuCuDeviceGetCount = CuResult(*)(int*);
-    using CuCuDeviceGet = CuResult(*)(void*, int);
+    using CuCuDeviceGet = CuResult(*)(int*, int);
     using CuCuDeviceGetName = CuResult(*)(char*, int, int);
     using CuCuDeviceGetAttribute = CuResult(*)(int*, int, int);
-    using CuCuCtxCreate = CuResult(*)(void**, unsigned int, int);
+    using CuCuCtxCreate = CuResult(*)(void**, void*, unsigned int, int);
     using CuCuModuleLoadData = CuResult(*)(void**, const void*);
     using CuCuModuleGetFunction = CuResult(*)(void**, void*, const char*);
     using CuCuMemAlloc = CuResult(*)(uint64_t*, size_t);
