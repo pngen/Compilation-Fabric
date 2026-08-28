@@ -168,6 +168,9 @@ bool DistributedCoordinator::rejectStalePublication(const ProtoEnvelope& env, co
         if (env.artifactGen == 0) { rejectedStale_.fetch_add(1); return true; }
         auto gi = artifactGen_.find(env.artifactId.toHex());
         if (gi != artifactGen_.end() && env.artifactGen <= gi->second) { rejectedStale_.fetch_add(1); return true; }
+        // Obsolete / stale compilation attempt: the request must currently have a pending attempt.
+        auto pi = pending_.find(env.requestId.toHex());
+        if (pi == pending_.end() || !pi->second) { rejectedStale_.fetch_add(1); return true; }
     }
     return false;
 }
@@ -175,7 +178,6 @@ bool DistributedCoordinator::rejectStalePublication(const ProtoEnvelope& env, co
 void DistributedCoordinator::handleWorker(FramedChannel& ch, const ProtoFrame& regFrame) {
     if (regFrame.payload.size() < kEnvSize) return;
     ProtoEnvelope env = readEnv(regFrame.payload.data(), regFrame.payload.size());
-    if (checkAuthority(env, false) != ErrorCode::Ok) { rejectedStale_.fetch_add(1); return; }
     Json caps = decodeRegister(regFrame.payload);
     {
         std::lock_guard<std::mutex> l(mtx_);
@@ -192,6 +194,7 @@ void DistributedCoordinator::handleWorker(FramedChannel& ch, const ProtoFrame& r
         if (f.type != MsgType::CompileResult) continue;
         if (f.payload.size() < kEnvSize) continue;
         ProtoEnvelope env2 = readEnv(f.payload.data(), f.payload.size());
+        if (rejectStalePublication(env2, "worker-result")) continue;
         bool success = false;
         Json resultJson = decodeCompileResult(f.payload, success);
         if (!success) continue;
@@ -298,7 +301,7 @@ void DistributedCoordinator::handleConnection(TcpSocket sock) {
     if (!fr.ok()) return;
     ProtoFrame first = *fr;
     if (first.type == MsgType::Register) handleWorker(ch, first);
-    else if (first.type == MsgType::Submit) handleClient(ch, first);
+    else if (first.type == MsgType::Submit || first.type == MsgType::Control || first.type == MsgType::Invalidate) handleClient(ch, first);
 }
 
 Result<void> DistributedCoordinator::run() {
