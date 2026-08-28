@@ -58,6 +58,7 @@ std::vector<uint8_t> encodeFrameBody(const ProtoFrame& f) {
     w.u32(static_cast<uint32_t>(f.type));
     w.u32(f.flags);
     w.u32(f.seq);
+    w.u64(f.payload.size());
     w.bytes(f.payload.data(), f.payload.size());
     return w.take();
 }
@@ -176,7 +177,7 @@ Result<std::pair<CompilationRequest, CompilationKey>> decodeDispatch(const std::
     auto req = CompilationRequest::fromJson(*j);
     if (!req) return Err<std::pair<CompilationRequest, CompilationKey>>(ErrorCode::MalformedFrame, "dispatch request decode failed");
     uint64_t keyLen; if (!r.u64(keyLen)) return Err<std::pair<CompilationRequest, CompilationKey>>(ErrorCode::MalformedFrame, "truncated key len");
-    std::string_view kb; if (!r.bytesBlob(kb) || kb.size() != keyLen) return Err<std::pair<CompilationRequest, CompilationKey>>(ErrorCode::MalformedFrame, "truncated key");
+    std::string_view kb; if (!r.rawBlob(keyLen, kb) || kb.size() != keyLen) return Err<std::pair<CompilationRequest, CompilationKey>>(ErrorCode::MalformedFrame, "truncated key");
     auto key = CompilationKey::fromCanonicalBytes(reinterpret_cast<const uint8_t*>(kb.data()), kb.size());
     if (!key) return Err<std::pair<CompilationRequest, CompilationKey>>(ErrorCode::MalformedFrame, "dispatch key decode failed");
     return Ok(std::make_pair(std::move(*req), *key));
@@ -232,7 +233,7 @@ Result<CompilationResult> decodeResult(const std::vector<uint8_t>& payload) {
     if (auto* rm = j->get("reference_matched")) res.referenceMatched = rm->asBool();
     if (auto* bu = j->get("backend_used")) res.backendUsed = bu->asString();
     uint64_t byteLen; if (!r.u64(byteLen)) return Err<CompilationResult>(ErrorCode::MalformedFrame, "truncated artifact len");
-    std::string_view ab; if (!r.bytesBlob(ab) || ab.size() != byteLen) return Err<CompilationResult>(ErrorCode::MalformedFrame, "truncated artifact bytes");
+    std::string_view ab; if (!r.rawBlob(byteLen, ab) || ab.size() != byteLen) return Err<CompilationResult>(ErrorCode::MalformedFrame, "truncated artifact bytes");
     res.artifactBytes.assign(ab.begin(), ab.end());
     return Ok(std::move(res));
 }

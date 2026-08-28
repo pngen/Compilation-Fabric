@@ -66,6 +66,7 @@ struct CompilationRequest {
     bool autotune = false;
     int autotuneCandidates = 1;
     uint64_t autotuneSeed = 0;
+    int optimizeLevel = 1;   // codegen knob, NOT part of the CompilationKey
     int blockSize = 0;                       // 0 = default
     int unrollFactor = 0;
     bool offlinePreferred = false;
@@ -123,6 +124,15 @@ struct StageResult {
     std::vector<uint8_t> output;             // stage output (e.g. lower/optimize/codegen/link)
 };
 
+struct AutotuneCandidate {
+    std::string variantId;
+    Json flags = Json::null();
+    bool validated = false;
+    double perfMs = 0.0;
+    ArtifactId artifactId;
+    std::string reason;
+};
+
 struct CompilationResult {
     CompilationRequestId requestId;
     CompilationPlanId planId;
@@ -144,6 +154,9 @@ struct CompilationResult {
     int64_t compileMs = 0;
     int64_t totalMs = 0;
     std::string backendUsed;
+    bool autotuned = false;
+    std::string autotuneWinner;
+    std::vector<AutotuneCandidate> autotuneCandidates;
     Json toJson() const;
 };
 

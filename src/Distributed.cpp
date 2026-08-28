@@ -45,7 +45,6 @@ int DistributedWorker::run() {
     initSockets();
     TcpSocket sock;
     auto cc = sock.connectTo(host_, port_);
-    if (!cc.ok()) { std::fprintf(stderr, "[worker] connect failed: %s\n", cc.message().c_str()); return 1; }
     FramedChannel ch(std::move(sock));
 
     WorkerBootId boot = WorkerBootId::fromU64(Clock::monotonicNanos());
@@ -74,9 +73,8 @@ int DistributedWorker::run() {
         if (f.type == MsgType::Heartbeat) { ProtoFrame hb; hb.type = MsgType::Heartbeat; ch.sendFrame(hb); continue; }
         if (f.type != MsgType::DispatchCompile) continue;
         ProtoEnvelope dispEnv = readEnv(f.payload.data(), f.payload.size());
-        auto dr = decodeDispatch(f.payload);
-        if (!dr.ok()) continue;
-        CompilationRequest req = dr->first;
+                auto dr = decodeDispatch(f.payload);
+                CompilationRequest req = dr->first;
         CompilationKey key = dr->second;
         auto plan = fabric.plan(req);
         KeyToolchainContext tc; tc.compiler="cf-cpu"; tc.backend="cpu"; tc.frontend="cf-frontend"; tc.compilerVersion="1.0.0";
@@ -102,8 +100,7 @@ int DistributedWorker::run() {
         outEnv.cacheGen = dispEnv.cacheGen; outEnv.toolchainGen = dispEnv.toolchainGen;
         outEnv.requestId = req.requestId; outEnv.attemptId = dispEnv.attemptId; outEnv.artifactId = res.artifactId; outEnv.artifactGen = res.generation;
         ProtoFrame crf; crf.type = MsgType::CompileResult; crf.payload = encodeCompileResult(outEnv, okFlag, res.toJson());
-        ch.sendFrame(crf);
-    }
+        ch.sendFrame(crf);     }
     std::error_code ec; std::filesystem::remove_all(root, ec);
     return 0;
 }
@@ -173,6 +170,7 @@ void DistributedCoordinator::handleWorker(FramedChannel& ch, const ProtoFrame& r
         std::lock_guard<std::mutex> l(mtx_);
         workers_[env.workerId] = caps;
         workerChannels_[env.workerId] = &ch;
+
     }
     for (;;) {
         auto fr = ch.recvFrame();
@@ -188,10 +186,12 @@ void DistributedCoordinator::handleWorker(FramedChannel& ch, const ProtoFrame& r
         Json resultJson = decodeCompileResult(f.payload, success);
         if (!success) continue;
         std::string keyStr = env2.requestId.toHex();
+        std::string pubKey = keyStr;
+        { std::lock_guard<std::mutex> l(mtx_); auto ki = reqToKey_.find(keyStr); if (ki != reqToKey_.end()) pubKey = ki->second; }
         completed_.fetch_add(1);
         {
             std::lock_guard<std::mutex> l(mtx_);
-            published_[keyStr] = resultJson;
+            published_[pubKey] = resultJson;
             auto gi = artifactGen_.find(env2.artifactId.toHex());
             if (gi == artifactGen_.end() || env2.artifactGen > gi->second) artifactGen_[env2.artifactId.toHex()] = env2.artifactGen;
             auto pi = pending_.find(keyStr);
@@ -201,76 +201,84 @@ void DistributedCoordinator::handleWorker(FramedChannel& ch, const ProtoFrame& r
     }
 }
 
-void DistributedCoordinator::handleClient(FramedChannel& ch) {
+void DistributedCoordinator::handleClient(FramedChannel& ch, const ProtoFrame& firstFrame) {
+    handleClientFrame(ch, firstFrame);
     for (;;) {
         auto fr = ch.recvFrame();
         if (!fr.ok()) return;
-        ProtoFrame f = *fr;
-        if (f.type == MsgType::Heartbeat) { ProtoFrame hb; hb.type = MsgType::Heartbeat; ch.sendFrame(hb); continue; }
-        if (f.type == MsgType::Shutdown) return;
-        if (f.type != MsgType::Submit && f.type != MsgType::Invalidate) continue;
-        ProtoEnvelope env = readEnv(f.payload.data(), f.payload.size());
-        if (f.type == MsgType::Invalidate) {
-            std::lock_guard<std::mutex> l(mtx_); published_.erase(env.requestId.toHex());
-            ProtoFrame ack; ack.type = MsgType::Reject; ack.payload = encodeReject(env, ErrorCode::Ok, "invalidated"); ch.sendFrame(ack);
-            continue;
-        }
-        auto dr = decodeSubmit(f.payload);
-        if (!dr.ok()) { ProtoFrame rej; rej.type = MsgType::Reject; ProtoEnvelope e; rej.payload = encodeReject(e, dr.code(), dr.message()); ch.sendFrame(rej); continue; }
-        CompilationRequest req = *dr;
-        CompilationPlan plan; bool havePlan = false;
-        if (auto p = fabric_->plan(req); p.ok()) { plan = *p; havePlan = true; }
-        (void)havePlan;
-        KeyToolchainContext tc; tc.compiler="cf-cpu"; tc.backend="cpu"; tc.frontend="cf-frontend";
-        CompilationKey key = buildCompilationKey(req, plan, tc);
-        std::string keyHexStr = key.toHex();
-        {
-            std::lock_guard<std::mutex> l(mtx_);
-            auto hit = published_.find(keyHexStr);
-            if (hit != published_.end()) {
-                ProtoEnvelope rEnv; rEnv.requestId = req.requestId;
-                ProtoFrame rf; rf.type = MsgType::Result; rf.payload = encodeResult(rEnv, resultFromJson(hit->second));
-                ch.sendFrame(rf); continue;
-            }
-        }
-        WorkerId selected = 0; bool haveWorker = false;
-        bool wantCuda = (plan.backend == "cuda-nvrtc");
-        {
-            std::lock_guard<std::mutex> l(mtx_);
-            for (auto& [wid, caps] : workers_) {
-                std::string bk = caps.get("backend") && caps.get("backend")->isString() ? caps.get("backend")->asString() : "cpu";
-                if (wantCuda) { if (bk == "cuda-nvrtc") { selected = wid; haveWorker = true; break; } }
-                else { if (bk == "cpu") { selected = wid; haveWorker = true; break; } }
-            }
-        }
-        if (!haveWorker) { ProtoEnvelope e; e.requestId = req.requestId; ProtoFrame rej; rej.type = MsgType::Reject; rej.payload = encodeReject(e, ErrorCode::NoBackend, "no capable worker"); ch.sendFrame(rej); continue; }
-        auto promise = std::make_shared<std::promise<CompilationResult>>();
-        std::string reqKey = req.requestId.toHex();
-        { std::lock_guard<std::mutex> l(mtx_); pending_[reqKey] = promise; }
-        ProtoEnvelope env2; env2.epoch = epoch_.load(); env2.workerId = selected; env2.cacheGen = cacheGen_.load(); env2.toolchainGen = toolchainGen_.load();
-        env2.requestId = req.requestId; env2.attemptId = CompilationAttemptId::fromU64(dispatched_.fetch_add(1) + 1);
-        FramedChannel* wch = nullptr;
-        { std::lock_guard<std::mutex> l(mtx_); auto wi = workerChannels_.find(selected); if (wi != workerChannels_.end()) wch = wi->second; }
-        if (!wch) { std::lock_guard<std::mutex> l(mtx_); pending_.erase(reqKey); ProtoFrame rej; rej.type = MsgType::Reject; rej.payload = encodeReject(env2, ErrorCode::NoBackend, "worker gone"); ch.sendFrame(rej); continue; }
-        ProtoFrame disp; disp.type = MsgType::DispatchCompile; disp.payload = encodeDispatch(env2, req, key);
-        if (!wch->sendFrame(disp).ok()) { std::lock_guard<std::mutex> l(mtx_); pending_.erase(reqKey); ProtoFrame rej; rej.type = MsgType::Reject; rej.payload = encodeReject(env2, ErrorCode::IOError, "dispatch failed"); ch.sendFrame(rej); continue; }
-        auto fut = promise->get_future();
-        CompilationResult res = fut.get();
-        ProtoEnvelope rEnv; rEnv.requestId = req.requestId;
-        ProtoFrame rf; rf.type = (res.error == ErrorCode::Ok) ? MsgType::Result : MsgType::Reject;
-        if (res.error == ErrorCode::Ok) rf.payload = encodeResult(rEnv, res);
-        else rf.payload = encodeReject(rEnv, res.error, res.errorMessage);
-        ch.sendFrame(rf);
+        handleClientFrame(ch, *fr);
     }
+}
+
+void DistributedCoordinator::handleClientFrame(FramedChannel& ch, const ProtoFrame& f) {
+    if (f.type == MsgType::Heartbeat) { ProtoFrame hb; hb.type = MsgType::Heartbeat; ch.sendFrame(hb); return; }
+    if (f.type == MsgType::Shutdown) return;
+    if (f.type != MsgType::Submit && f.type != MsgType::Invalidate) return;
+    ProtoEnvelope env = readEnv(f.payload.data(), f.payload.size());
+    if (f.type == MsgType::Invalidate) {
+        std::lock_guard<std::mutex> l(mtx_); published_.erase(env.requestId.toHex());
+        ProtoFrame ack; ack.type = MsgType::Reject; ack.payload = encodeReject(env, ErrorCode::Ok, "invalidated"); ch.sendFrame(ack);
+        return;
+    }
+    auto dr = decodeSubmit(f.payload);
+    if (!dr.ok()) { ProtoFrame rej; rej.type = MsgType::Reject; ProtoEnvelope e; rej.payload = encodeReject(e, dr.code(), dr.message()); ch.sendFrame(rej); return; }
+    CompilationRequest req = *dr;
+    CompilationPlan plan; bool havePlan = false;
+    if (auto p = fabric_->plan(req); p.ok()) { plan = *p; havePlan = true; }
+    (void)havePlan;
+    KeyToolchainContext tc; tc.compiler="cf-cpu"; tc.backend="cpu"; tc.frontend="cf-frontend";
+    CompilationKey key = buildCompilationKey(req, plan, tc);
+    std::string keyHexStr = key.toHex();
+    { std::lock_guard<std::mutex> l(mtx_); reqToKey_[req.requestId.toHex()] = keyHexStr; }
+    {
+        std::lock_guard<std::mutex> l(mtx_);
+        auto hit = published_.find(keyHexStr);
+        if (hit != published_.end()) {
+            CompilationResult cached = resultFromJson(hit->second);
+            cached.reused = true;
+            ProtoEnvelope rEnv; rEnv.requestId = req.requestId;
+            ProtoFrame rf; rf.type = MsgType::Result; rf.payload = encodeResult(rEnv, cached);
+            ch.sendFrame(rf); return;
+        }
+    }
+    WorkerId selected = 0; bool haveWorker = false;
+    bool wantCuda = (plan.backend == "cuda-nvrtc");
+    {
+        std::lock_guard<std::mutex> l(mtx_);
+        for (auto& [wid, caps] : workers_) {
+            std::string bk = caps.get("backend") && caps.get("backend")->isString() ? caps.get("backend")->asString() : "cpu";
+            if (wantCuda) { if (bk == "cuda-nvrtc") { selected = wid; haveWorker = true; break; } }
+            else { if (bk == "cpu") { selected = wid; haveWorker = true; break; } }
+        }
+    }
+    if (!haveWorker) { ProtoEnvelope e; e.requestId = req.requestId; ProtoFrame rej; rej.type = MsgType::Reject; rej.payload = encodeReject(e, ErrorCode::NoBackend, "no capable worker"); ch.sendFrame(rej); return; }
+    auto promise = std::make_shared<std::promise<CompilationResult>>();
+    std::string reqKey = req.requestId.toHex();
+    { std::lock_guard<std::mutex> l(mtx_); pending_[reqKey] = promise; }
+    ProtoEnvelope env2; env2.epoch = epoch_.load(); env2.workerId = selected; env2.cacheGen = cacheGen_.load(); env2.toolchainGen = toolchainGen_.load();
+    env2.requestId = req.requestId; env2.attemptId = CompilationAttemptId::fromU64(dispatched_.fetch_add(1) + 1);
+    FramedChannel* wch = nullptr;
+    { std::lock_guard<std::mutex> l(mtx_); auto wi = workerChannels_.find(selected); if (wi != workerChannels_.end()) wch = wi->second; }
+    if (!wch) { std::lock_guard<std::mutex> l(mtx_); pending_.erase(reqKey); ProtoFrame rej; rej.type = MsgType::Reject; rej.payload = encodeReject(env2, ErrorCode::NoBackend, "worker gone"); ch.sendFrame(rej); return; }
+    ProtoFrame disp; disp.type = MsgType::DispatchCompile; disp.payload = encodeDispatch(env2, req, key);
+    if (!wch->sendFrame(disp).ok()) { std::lock_guard<std::mutex> l(mtx_); pending_.erase(reqKey); ProtoFrame rej; rej.type = MsgType::Reject; rej.payload = encodeReject(env2, ErrorCode::IOError, "dispatch failed"); ch.sendFrame(rej); return; }
+    auto fut = promise->get_future();
+    CompilationResult res = fut.get();
+    ProtoEnvelope rEnv; rEnv.requestId = req.requestId;
+    ProtoFrame rf; rf.type = (res.error == ErrorCode::Ok) ? MsgType::Result : MsgType::Reject;
+    if (res.error == ErrorCode::Ok) rf.payload = encodeResult(rEnv, res);
+    else rf.payload = encodeReject(rEnv, res.error, res.errorMessage);
+    ch.sendFrame(rf);
 }
 
 void DistributedCoordinator::handleConnection(TcpSocket sock) {
     FramedChannel ch(std::move(sock));
     auto fr = ch.recvFrame();
     if (!fr.ok()) return;
+    if (!fr.ok()) return;
     ProtoFrame first = *fr;
     if (first.type == MsgType::Register) handleWorker(ch, first);
-    else if (first.type == MsgType::Submit) handleClient(ch);
+    else if (first.type == MsgType::Submit) handleClient(ch, first);
 }
 
 Result<void> DistributedCoordinator::run() {
@@ -286,7 +294,6 @@ Result<void> DistributedCoordinator::run() {
         std::thread t([this, s = std::move(acc.value()) ]() mutable { handleConnection(std::move(s)); });
         t.detach();
     }
-    return OkVoid();
 }
 
 // ---------------------------------------------------------------------------

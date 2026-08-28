@@ -13,6 +13,7 @@
 #include <thread>
 #include <filesystem>
 #include <algorithm>
+#include <limits>
 
 namespace compilationfabric {
 
@@ -277,17 +278,80 @@ Result<CompilationResult> CompilationFabric::compile(const CompilationRequest& r
         return Err<CompilationResult>(ErrorCode::NoBackend, "no backend " + plan.backend);
     }
     auto backend = backendIt->second;
-    int64_t t0 = nowMs();
-    auto bo = backend->compile(request, plan, tc);
-    int64_t compileMs = nowMs() - t0;
-    if (!bo.ok()) {
-        std::lock_guard<std::mutex> l(i.regMutex_);
-        owned->done = true; owned->success = false; owned->failure = bo.code(); owned->failureMsg = bo.message(); owned->cv.notify_all();
+    // Enforce toolchain/target capability before compiling.
+    auto compatChk = backend->checkCompatible(plan);
+    if (!compatChk.ok()) {
+        std::lock_guard<std::mutex> l2(i.regMutex_);
+        owned->done = true; owned->success = false; owned->failure = compatChk.code(); owned->failureMsg = compatChk.message(); owned->cv.notify_all();
         i.obs.count("compile_failures");
-        i.obs.recordEvent("compile_failed", Json::object({{"backend", Json::str(plan.backend)}, {"error", Json::str(bo.message())}}));
-        return Err<CompilationResult>(bo.code(), bo.message());
+        return Err<CompilationResult>(compatChk.code(), compatChk.message());
     }
-    BackendOutput output = *bo;
+    int64_t t0 = nowMs();
+    bool autotuned = false;
+    std::string autotuneWinner;
+    std::vector<AutotuneCandidate> autotuneCands;
+    BackendOutput output;
+    // Bounded autotuning: evaluate candidate codegen variants, measure validated
+    // execution performance, and select the best among evaluated candidates.
+    if (request.autotune && request.autotuneCandidates > 1) {
+        autotuned = true;
+        int winnerIx = -1; double bestMs = (std::numeric_limits<double>::max)();
+        for (int vi = 0; vi < request.autotuneCandidates; ++vi) {
+            CompilationRequest vr = request;
+            vr.optimizeLevel = (vi == 0) ? 0 : std::max(request.optimizeLevel, 1);
+            vr.autotuneSeed = request.autotuneSeed + static_cast<uint64_t>(vi);
+            auto bo = backend->compile(vr, plan, tc);
+            AutotuneCandidate ac; ac.variantId = "variant-" + std::to_string(vi);
+            ac.flags = Json::object({{"optimize_level", Json::number(static_cast<double>(vr.optimizeLevel))}, {"seed", Json::number(static_cast<double>(vr.autotuneSeed))}});
+            if (!bo.ok()) { ac.validated = false; ac.perfMs = -1.0; ac.reason = bo.message(); autotuneCands.push_back(ac); continue; }
+            ArtifactDescriptor vad; vad.id = ArtifactId::fromU64(Clock::monotonicNanos() & 0x7FFFFFFFFFFFFFFFULL);
+            vad.generation = 1; vad.format = bo->format; vad.specialization = bo->specialization;
+            vad.backend = bo->backend; vad.keyDigest = key.digest();
+            vad.contentDigest = Sha256::hash(bo->executable.data(), bo->executable.size());
+            auto vd = backend->validate(vad, bo->executable);
+            ac.validated = vd.ok() && vd->passed;
+            double perf = 0.0;
+            if (ac.validated) {
+                auto mod = backend->load(vad, bo->executable);
+                if (mod.ok()) {
+                    auto s0 = Clock::monotonicNanos();
+                    auto exe = (*mod)->executeSmoke();
+                    perf = static_cast<double>(Clock::monotonicNanos() - s0) / 1e6;
+                    (void)exe;
+                }
+            }
+            ac.perfMs = perf; ac.artifactId = vad.id;
+            ac.reason = ac.validated ? (perf > 0.0 ? "validated+measured" : "validated(nil perf)") : "validation_failed";
+            autotuneCands.push_back(ac);
+            if (ac.validated && perf > 0.0 && perf < bestMs) { bestMs = perf; winnerIx = vi; }
+        }
+        if (winnerIx < 0) { for (int vi = 0; vi < (int)autotuneCands.size(); ++vi) if (autotuneCands[vi].validated) { winnerIx = vi; break; } }
+        if (winnerIx >= 0) {
+            CompilationRequest wr = request;
+            wr.optimizeLevel = (winnerIx == 0) ? 0 : std::max(request.optimizeLevel, 1);
+            wr.autotuneSeed = request.autotuneSeed + static_cast<uint64_t>(winnerIx);
+            auto wob = backend->compile(wr, plan, tc);
+            if (wob.ok()) { output = *wob; autotuneWinner = autotuneCands[winnerIx].variantId; }
+        }
+        if (output.executable.empty()) { auto wob = backend->compile(request, plan, tc); if (wob.ok()) output = *wob; }
+    } else {
+        auto bo = backend->compile(request, plan, tc);
+        if (!bo.ok()) {
+            std::lock_guard<std::mutex> l(i.regMutex_);
+            owned->done = true; owned->success = false; owned->failure = bo.code(); owned->failureMsg = bo.message(); owned->cv.notify_all();
+            i.obs.count("compile_failures");
+            i.obs.recordEvent("compile_failed", Json::object({{"backend", Json::str(plan.backend)}, {"error", Json::str(bo.message())}}));
+            return Err<CompilationResult>(bo.code(), bo.message());
+        }
+        output = *bo;
+    }
+    if (output.executable.empty()) {
+        std::lock_guard<std::mutex> l(i.regMutex_);
+        owned->done = true; owned->success = false; owned->failure = ErrorCode::BuildFailed; owned->failureMsg = "no candidate produced an artifact"; owned->cv.notify_all();
+        i.obs.count("compile_failures");
+        return Err<CompilationResult>(ErrorCode::BuildFailed, "no candidate produced an artifact");
+    }
+    int64_t compileMs = nowMs() - t0;
 
     // Validate (real validation, required before eligibility).
     int64_t t1 = nowMs();
@@ -360,6 +424,7 @@ Result<CompilationResult> CompilationFabric::compile(const CompilationRequest& r
     res.reused = false; res.validated = true; res.deployable = true; res.referenceMatched = art.validation.referenceComparison;
     res.compatibilityDecision = "Compiled";
     res.backendUsed = plan.backend; res.compileMs = compileMs; res.totalMs = compileMs + validateMs;
+    res.autotuned = autotuned; res.autotuneWinner = autotuneWinner; res.autotuneCandidates = autotuneCands;
     for (auto& s : output.stages) { StageResult sr; sr.kind = s.kind; sr.ran = true; sr.succeeded = true; sr.durationMs = s.durationMs; sr.message = s.message; res.stages.push_back(std::move(sr)); }
 
     std::lock_guard<std::mutex> l(i.regMutex_);

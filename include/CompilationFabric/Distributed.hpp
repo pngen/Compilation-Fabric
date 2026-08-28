@@ -57,7 +57,8 @@ public:
 private:
     void handleConnection(TcpSocket sock);
     void handleWorker(FramedChannel& ch, const ProtoFrame& regFrame);
-    void handleClient(FramedChannel& ch);
+    void handleClient(FramedChannel& ch, const ProtoFrame& firstFrame);
+    void handleClientFrame(FramedChannel& ch, const ProtoFrame& f);
     ErrorCode checkAuthority(const ProtoEnvelope& env, bool forWorker) const;
     bool rejectStalePublication(const ProtoEnvelope& env, const std::string& context);
     void dispatchToWorker(CompilationResult& out, const CompilationRequest& req, const CompilationKey& key);
@@ -72,6 +73,7 @@ private:
     std::map<WorkerId, FramedChannel*> workerChannels_;
     std::map<std::string, CompilationAttemptId> inflight_;
     std::map<std::string, std::shared_ptr<std::promise<CompilationResult>>> pending_;
+    std::map<std::string, std::string> reqToKey_;
     std::map<std::string, Json> published_;
     std::map<std::string, ArtifactGeneration> artifactGen_;
     std::unique_ptr<CompilationFabric> fabric_;

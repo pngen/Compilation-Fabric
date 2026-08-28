@@ -77,6 +77,7 @@ Json CompilationRequest::toJson() const {
     j.set("block_size", Json::number(static_cast<double>(blockSize)));
     j.set("unroll_factor", Json::number(static_cast<double>(unrollFactor)));
     j.set("offline_preferred", Json::boolean(offlinePreferred));
+    j.set("optimize_level", Json::number(static_cast<double>(optimizeLevel)));
     return j;
 }
 
@@ -113,6 +114,7 @@ std::optional<CompilationRequest> CompilationRequest::fromJson(const Json& j) {
     r.autotuneSeed = JNUM64(j, "autotune_seed");
     r.blockSize = static_cast<int>(JNUM64(j, "block_size")); r.unrollFactor = static_cast<int>(JNUM64(j, "unroll_factor"));
     r.offlinePreferred = JBOOL(j, "offline_preferred");
+    r.optimizeLevel = static_cast<int>(JNUM64(j, "optimize_level")); if (r.optimizeLevel <= 0) r.optimizeLevel = 1;
     return r;
 }
 
@@ -180,6 +182,16 @@ Json CompilationResult::toJson() const {
     j.set("compile_ms", Json::number(static_cast<double>(compileMs)));
     j.set("total_ms", Json::number(static_cast<double>(totalMs)));
     j.set("backend_used", Json::str(backendUsed));
+    j.set("autotuned", Json::boolean(autotuned));
+    j.set("autotune_winner", Json::str(autotuneWinner));
+    std::vector<Json> ac;
+    for (auto& a : autotuneCandidates) {
+        Json ae = Json::object({}); ae.set("variant_id", Json::str(a.variantId)); ae.set("flags", a.flags);
+        ae.set("validated", Json::boolean(a.validated)); ae.set("perf_ms", Json::number(a.perfMs));
+        ae.set("artifact_id", Json::str(a.artifactId.toHex())); ae.set("reason", Json::str(a.reason));
+        ac.push_back(std::move(ae));
+    }
+    j.set("autotune_candidates", Json::array(std::move(ac)));
     return j;
 }
 

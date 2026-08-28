@@ -283,16 +283,21 @@ Result<BackendOutput> CpuBackend::compile(const CompilationRequest& request,
     prog.launchConfig = request.launchSpecialization;
     int64_t lowerMs = nowMs() - t0;
 
-    // Optimize: constant-fold scale(1.0)/sub(0)/add(0) -> id, drop Nops.
+    // Optimize: when optimizeLevel > 0, constant-fold scale(1.0)/sub(0)/add(0) -> id
+    // and drop Nops. At optimizeLevel 0 the operation list is preserved verbatim, so
+    // variants differ in their compiled artifact while remaining semantically equal.
     int64_t t1 = nowMs();
+    bool doFold = request.optimizeLevel > 0;
     std::vector<CpuOp> opt;
     for (auto& op : prog.ops) {
         bool identity = false;
-        if (op.kind == CpuOpKind::Scale && op.scalar == 1.0) identity = true;
-        if (op.kind == CpuOpKind::Add && op.scalar == 0.0) identity = true;
-        if (op.kind == CpuOpKind::Sub && op.scalar == 0.0) identity = true;
-        if (op.kind == CpuOpKind::Nop) continue;
-        if (identity) continue;
+        if (doFold) {
+            if (op.kind == CpuOpKind::Scale && op.scalar == 1.0) identity = true;
+            if (op.kind == CpuOpKind::Add && op.scalar == 0.0) identity = true;
+            if (op.kind == CpuOpKind::Sub && op.scalar == 0.0) identity = true;
+            if (op.kind == CpuOpKind::Nop) continue;
+            if (identity) continue;
+        }
         opt.push_back(op);
     }
     if (opt.empty()) opt = prog.ops;
