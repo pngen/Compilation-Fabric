@@ -65,6 +65,11 @@ int main(int argc, char** argv) {
     double rejected = st3->get("rejected_stale")?st3->get("rejected_stale")->asNumber():-1; CF_CHECK(rejected >= 5);
     double pubAfter = st3->get("published_count")?st3->get("published_count")->asNumber():0; CF_CHECK(pubAfter == pubBefore);
     auto f1 = client.submit(req); CF_CHECK(f1.ok()); CF_CHECK_EQ(f1->validated, true);
+    auto stE = client.control(ControlKind::GetStats); CF_CHECK(stE.ok());
+    double pending = stE->get("pending_count") ? stE->get("pending_count")->asNumber() : -1;
+    CF_CHECK(pending == 0);   // zero active builds after closure
+    double wcnt = stE->get("workers") ? stE->get("workers")->asNumber() : -1;
+    CF_CHECK(wcnt >= 2);
     auto f2 = client.submit(req); CF_CHECK(f2.ok()); CF_CHECK_EQ(f2->reused, true);
     std::printf("atomic_cluster: reused_hit=%d rejected_stale=%d fresh_ok=%d second_hit=%d\n", (int)r2->reused, (int)rejected, (int)f1.ok(), (int)f2->reused);
     CF_FINISH("atomic_driver");

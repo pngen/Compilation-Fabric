@@ -128,6 +128,7 @@ Json DistributedCoordinator::stats() const {
     j.set("workers", Json::number(static_cast<double>(workerCount())));
     j.set("completed", Json::number(static_cast<double>(completed_.load())));
     j.set("published_count", Json::number(static_cast<double>(published_.size())));
+    j.set("pending_count", Json::number(static_cast<double>(pending_.size())));
     j.set("rejected_stale", Json::number(static_cast<double>(rejectedStale_.load())));
     j.set("dispatched", Json::number(static_cast<double>(dispatched_.load())));
     j.set("duplicate_suppressed", Json::number(static_cast<double>(duplicateSuppressed_.load())));

@@ -6,6 +6,7 @@ set(COMPILATION_FABRIC_TESTS
     adversarial
     property
     cuda_backend
+    cuda_nvcc_backend
 )
 foreach(t ${COMPILATION_FABRIC_TESTS})
     add_executable(${t} ${t}.cpp)

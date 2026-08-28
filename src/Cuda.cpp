@@ -2,6 +2,9 @@
 // Copyright 2026 Summon Software Labs. Licensed under Apache 2.0.
 #include "CompilationFabric/Cuda.hpp"
 #include "CompilationFabric/CpuBackend.hpp"
+#include "CompilationFabric/Toolchain.hpp"
+#include <fstream>
+#include <filesystem>
 
 #include <cmath>
 #include <cstring>
@@ -339,6 +342,38 @@ Result<TargetDescriptor> CudaBackend::defaultTarget() const {
     return Ok(std::move(t));
 }
 
+Result<BackendOutput> CudaBackend::compileWithNvcc(const std::string& source, const std::string& arch,
+                                                  const CompilationRequest& request, const CompilationPlan& plan) {
+    (void)plan;
+    std::filesystem::path tmp = std::filesystem::temp_directory_path() / ("cfnvcc_" + std::to_string(Clock::monotonicNanos()));
+    std::error_code ec; std::filesystem::create_directories(tmp, ec);
+    std::string cu = (tmp / "k.cu").string(); std::string out = (tmp / "k.cubin").string();
+    { std::ofstream o(cu, std::ios::binary); o << source; }
+    std::string nvcc = "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.1\\bin\\nvcc.exe";
+    std::string vcvars = "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat";
+    std::string q = "\"";
+    std::string cmd = "call " + q + vcvars + q + " >nul 2>&1 && " + q + nvcc + q + " -cubin -arch=" + arch + " -o " + q + out + q + " " + q + cu + q;
+    int64_t t0 = Clock::monotonicNanos();
+    std::string log = ToolchainProbe::runCapture(cmd);
+    int64_t compileMs = (int64_t)((Clock::monotonicNanos() - t0) / 1000000);
+    (void)log;
+    if (!std::filesystem::exists(out, ec)) { std::filesystem::remove_all(tmp, ec); return Err<BackendOutput>(ErrorCode::BuildFailed, "nvcc offline compile failed: " + log); }
+    std::ifstream f(out, std::ios::binary); std::vector<uint8_t> cubin((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    std::filesystem::remove_all(tmp, ec);
+    BackendOutput bo;
+    bo.format = ArtifactFormat::CUBIN; bo.executable = std::move(cubin);
+    bo.backend.id = "cuda-nvcc"; bo.backend.name = "cuda-nvcc"; bo.backend.compilerId = "nvcc"; bo.backend.compilerVersion = "13.1.80";
+    bo.backend.codeGenerator = "nvcc"; bo.backend.optimizer = "nvcc-opt"; bo.backend.linker = "nvcc"; bo.backend.runtime = "cuda-driver";
+    bo.backend.targetArchitecture = arch; bo.backend.supportsOffline = true;
+    bo.compiler.id = "nvcc"; bo.compiler.version = "13.1.80"; bo.compiler.vendor = "NVIDIA"; bo.compiler.backendType = "offline";
+    bo.specialization.datatype = request.datatype != Datatype::None ? request.datatype : Datatype::F32;
+    bo.specialization.shape = request.staticShape; bo.specialization.architecture = arch; bo.specialization.launchSpecialization = "nvcc-offline";
+    bo.deterministic = false;
+    StageResult s1; s1.kind = StageKind::Assemble; s1.ran = true; s1.succeeded = true; s1.message = "nvcc -cubin " + arch + " (" + std::to_string(compileMs) + " ms)";
+    bo.stages.push_back(s1);
+    return Ok(bo);
+}
+
 Result<BackendOutput> CudaBackend::compile(const CompilationRequest& request, const CompilationPlan& plan, const KeyToolchainContext& tc) {
     (void)tc; (void)plan;
     auto a = getApi();
@@ -358,9 +393,19 @@ Result<BackendOutput> CudaBackend::compile(const CompilationRequest& request, co
     if (spec.op == "scale" && spec.scalar == 0.0) spec.scalar = 1.0;
 
     std::string src = generateKernel(spec);
+    std::string targetArch = request.targetArchitecture.empty() ? "sm_120" : request.targetArchitecture;
+    if (request.backend == "cuda-nvcc" || request.offlinePreferred) {
+        auto nv = compileWithNvcc(src, targetArch, request, plan);
+        if (nv.ok()) {
+            (*nv).specialization.datatype = spec.dt;
+            (*nv).specialization.shape = {static_cast<int64_t>(spec.n)};
+            (*nv).specialization.architecture = targetArch;
+            (*nv).specialization.launchSpecialization = spec.encode();
+        }
+        return nv;
+    }
     std::vector<const char*> opts = {"--gpu-architecture=sm_120", "--std=c++17", "-default-device"};
     void* progObj = nullptr;
-    std::fprintf(stderr, "%s\n", src.c_str());
     if (a->createProgram(&progObj, src.c_str(), "cf_kernel.cpp", 0, nullptr, nullptr) != NVRTC_SUCCESS)
         return Err<BackendOutput>(ErrorCode::BuildFailed, "nvrtcCreateProgram failed");
     auto cleanupProg = [&]{ if (progObj) { if (a->destroyProgram) a->destroyProgram(&progObj); progObj = nullptr; } };
@@ -456,7 +501,8 @@ Result<ValidationDescriptor> CudaBackend::validate(const ArtifactDescriptor& des
     bool success = (result == CUDA_SUCCESS);
     bool matched = false;
     if (success) {
-        if (a->cuMemcpyDtoH(hOut.data(), outBuf, bytes) == CUDA_SUCCESS) {
+        int d2h = a->cuMemcpyDtoH(hOut.data(), outBuf, bytes);
+        if (d2h == CUDA_SUCCESS) {
             auto ref = computeCudaReference(descriptor, seed, n, dt);
             size_t refN = ref.size();
             if (refN == n || refN == 1) {

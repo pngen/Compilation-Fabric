@@ -82,7 +82,7 @@ CompilationFabric::CompilationFabric(CompilationFabricConfig config) : impl_(std
     i.cpuBackend = std::make_shared<CpuBackend>();
     i.cudaBackend = std::make_shared<CudaBackend>();
     i.backends["cpu"] = i.cpuBackend;
-    if (config.allowCuda && CudaBackend::api()->available()) i.backends["cuda-nvrtc"] = i.cudaBackend;
+    if (config.allowCuda && CudaBackend::api()->available()) { i.backends["cuda-nvrtc"] = i.cudaBackend; i.backends["cuda-nvcc"] = i.cudaBackend; }
 
     i.toolchainProbe = std::make_shared<ToolchainProbe>(CudaBackend::api());
     i.toolchain = i.toolchainProbe->probe();
@@ -143,21 +143,21 @@ Result<CompilationPlan> CompilationFabric::plan(const CompilationRequest& reques
                      request.isa.rfind("sm_", 0) == 0);
     bool cudaOk = CudaBackend::api()->available();
     std::string backend = "cpu";
-    if (wantCuda && cudaOk && i.backends.count("cuda-nvrtc")) backend = "cuda-nvrtc";
+    if (wantCuda && cudaOk && i.backends.count("cuda-nvrtc")) backend = (request.backend == "cuda-nvcc") ? "cuda-nvcc" : "cuda-nvrtc";
     else if (wantCuda && !cudaOk) {
         std::ostringstream os; os << "CUDA requested but unavailable";
         // Don't fail planning; plan() returns a plan that will fail at compile with a clear reason.
     }
 
     p.backend = backend;
-    p.compiler = (backend == "cuda-nvrtc") ? "nvrtc" : "cf-cpu";
+    p.compiler = ((backend == "cuda-nvrtc" || backend == "cuda-nvcc")) ? "nvrtc" : (backend == "cuda-nvcc") ? "nvcc" : "cf-cpu";
     p.frontend = "cf-frontend";
-    p.optimizer = (backend == "cuda-nvrtc") ? "nvrtc-opt" : "cf-cpu-opt";
-    p.linker = (backend == "cuda-nvrtc") ? "nvrtc" : "cf-cpu-link";
-    p.runtime = (backend == "cuda-nvrtc") ? "cuda-driver" : "cf-cpu-runtime";
+    p.optimizer = ((backend == "cuda-nvrtc" || backend == "cuda-nvcc")) ? "nvrtc-opt" : "cf-cpu-opt";
+    p.linker = ((backend == "cuda-nvrtc" || backend == "cuda-nvcc")) ? "nvrtc" : "cf-cpu-link";
+    p.runtime = ((backend == "cuda-nvrtc" || backend == "cuda-nvcc")) ? "cuda-driver" : "cf-cpu-runtime";
 
     // target
-    if (backend == "cuda-nvrtc") {
+    if ((backend == "cuda-nvrtc" || backend == "cuda-nvcc")) {
         // Prefer an advertised CUDA target when present; otherwise build one.
         for (auto& tt : i.targets) if (tt.architecture == "sm_120" || tt.vendor == AcceleratorVendor::Nvidia) { p.target = tt; break; }
         p.target.vendor = AcceleratorVendor::Nvidia;
@@ -185,13 +185,13 @@ Result<CompilationPlan> CompilationFabric::plan(const CompilationRequest& reques
     // stages
     p.stages = {StageKind::Normalize, StageKind::Lower, StageKind::Optimize, StageKind::Codegen,
                 StageKind::Validate, StageKind::Persist, StageKind::Deploy};
-    p.requiredToolchainCapabilities = {"compiler", backend == "cuda-nvrtc" ? "nvrtc" : "deterministic"};
+    p.requiredToolchainCapabilities = {"compiler", (backend == "cuda-nvrtc" || backend == "cuda-nvcc") ? "nvrtc" : "deterministic"};
     p.reproducibility = request.reproducibility != ReproducibilityMode::Unspecified ? request.reproducibility : config_.reproducibility;
     p.cachePolicy = "exact";
 
     std::ostringstream reason;
     reason << "selected backend " << backend << " because ";
-    if (backend == "cuda-nvrtc") reason << "request targeted an NVIDIA/CUDA architecture and NVRTC is available";
+    if ((backend == "cuda-nvrtc" || backend == "cuda-nvcc")) reason << "request targeted an NVIDIA/CUDA architecture and NVRTC is available";
     else reason << "the request is CPU-targeted or CUDA is unavailable; the deterministic CPU backend satisfies it";
     p.reason = reason.str();
     return Ok(std::move(p));
@@ -204,7 +204,7 @@ namespace {
 KeyToolchainContext makeTc(const CompilationPlan& plan, const ToolchainDescriptor& toolchain, const CompilationFabricConfig& config) {
     KeyToolchainContext tc;
     tc.frontend = plan.frontend; tc.frontendVersion = "1.0.0";
-    if (plan.backend == "cuda-nvrtc") { tc.compiler = "nvrtc"; tc.compilerVersion = toolchain.nvrtcVersion; tc.backend = "cuda-nvrtc"; tc.backendVersion = toolchain.nvrtcVersion; tc.codeGenerator = "nvrtc"; tc.optimizer = "nvrtc-opt"; tc.linker = "nvrtc"; tc.runtime = "cuda-driver"; tc.driver = "nvidia"; tc.driverVersion = toolchain.cudaDriverVersion; }
+    if (plan.backend == "cuda-nvrtc" || plan.backend == "cuda-nvcc") { tc.compiler = "nvrtc"; tc.compilerVersion = toolchain.nvrtcVersion; tc.backend = "cuda-nvrtc"; tc.backendVersion = toolchain.nvrtcVersion; tc.codeGenerator = "nvrtc"; tc.optimizer = "nvrtc-opt"; tc.linker = "nvrtc"; tc.runtime = "cuda-driver"; tc.driver = "nvidia"; tc.driverVersion = toolchain.cudaDriverVersion; }
     else { tc.compiler = "cf-cpu"; tc.compilerVersion = "1.0.0"; tc.backend = "cpu"; tc.backendVersion = "1.0.0"; tc.codeGenerator = "cf-cpu-codegen"; tc.optimizer = "cf-cpu-opt"; tc.linker = "cf-cpu-link"; tc.runtime = "cf-cpu-runtime"; }
     tc.environmentFingerprint = config.environmentFingerprint;
     return tc;
@@ -392,7 +392,7 @@ Result<CompilationResult> CompilationFabric::compile(const CompilationRequest& r
     art.state = "Deployable";
     art.deployment.deployable = true; art.deployment.runtimeCompatible = true;
     art.deployment.architectureValidated = true; art.deployment.generationValidated = true;
-    art.deployment.method = (plan.backend == "cuda-nvrtc") ? "cuda-load" : "cpu-execute";
+    art.deployment.method = (plan.backend == "cuda-nvrtc" || plan.backend == "cuda-nvcc") ? "cuda-load" : "cpu-execute";
 
     // Commit to cache + persist, checking generation authority (no stale publish).
     {

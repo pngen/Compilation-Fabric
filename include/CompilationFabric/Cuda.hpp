@@ -9,6 +9,7 @@
 // Copyright 2026 Summon Software Labs. Licensed under Apache 2.0.
 #pragma once
 #include "CompilationFabric/Backend.hpp"
+#include <string>
 
 namespace compilationfabric {
 
@@ -134,6 +135,8 @@ public:
     // Reconstruct the deterministic CPU reference for a CUDA artifact produced from
     // a CF program specialization, used for load-launch parity validation.
     static std::vector<double> computeCudaReference(const ArtifactDescriptor& d, uint64_t seed, uint32_t n, Datatype dt);
+    // Real offline nvcc compilation to a loadable CUBIN for the target architecture.
+    static Result<BackendOutput> compileWithNvcc(const std::string& source, const std::string& arch, const CompilationRequest& request, const CompilationPlan& plan);
     static std::shared_ptr<CudaApi>& api();
 
 private:
