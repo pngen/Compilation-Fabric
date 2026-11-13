@@ -169,50 +169,104 @@ bool DistributedCoordinator::rejectStalePublication(const ProtoEnvelope& env, co
         if (env.artifactGen == 0) { rejectedStale_.fetch_add(1); return true; }
         auto gi = artifactGen_.find(env.artifactId.toHex());
         if (gi != artifactGen_.end() && env.artifactGen <= gi->second) { rejectedStale_.fetch_add(1); return true; }
-        // Obsolete / stale compilation attempt: the request must currently have a pending attempt.
-        auto pi = pending_.find(env.requestId.toHex());
-        if (pi == pending_.end() || !pi->second) { rejectedStale_.fetch_add(1); return true; }
+        // Obsolete / stale compilation attempt: the attempt must currently be
+        // pending, for this request, under the authority it was dispatched with.
+        auto pi = pending_.find(env.attemptId.toHex());
+        if (pi == pending_.end() || pi->second.dispatch.requestId != env.requestId ||
+            pi->second.dispatch.epoch != env.epoch || pi->second.dispatch.cacheGen != env.cacheGen ||
+            pi->second.dispatch.toolchainGen != env.toolchainGen) { rejectedStale_.fetch_add(1); return true; }
     }
     return false;
+}
+
+void DistributedCoordinator::failPendingLocked(std::map<std::string, PendingCompile>::iterator it, ErrorCode code,
+                                               const std::string& msg) {
+    CompilationResult r; r.error = code; r.errorMessage = msg;
+    it->second.promise->set_value(r);
+    pending_.erase(it);
 }
 
 void DistributedCoordinator::handleWorker(FramedChannel& ch, const ProtoFrame& regFrame) {
     if (regFrame.payload.size() < kEnvSize) return;
     ProtoEnvelope env = readEnv(regFrame.payload.data(), regFrame.payload.size());
     Json caps = decodeRegister(regFrame.payload);
+    auto link = std::make_shared<WorkerLink>();
+    link->channel = &ch;
     {
         std::lock_guard<std::mutex> l(mtx_);
         workers_[env.workerId] = caps;
-        workerChannels_[env.workerId] = &ch;
-
+        workerChannels_[env.workerId] = link;
     }
+    // On exit: stop sends on this channel before it goes away, unregister the
+    // worker only while this connection is still its registration (a restarted
+    // worker may already have replaced it), and fail the compiles dispatched
+    // here so no requester waits forever.
+    auto detach = [&]() {
+        { std::lock_guard<std::mutex> sl(link->sendMutex); link->alive = false; }
+        std::lock_guard<std::mutex> l(mtx_);
+        auto ci = workerChannels_.find(env.workerId);
+        if (ci != workerChannels_.end() && ci->second == link) { workerChannels_.erase(ci); workers_.erase(env.workerId); }
+        for (auto pi = pending_.begin(); pi != pending_.end();) {
+            auto next = std::next(pi);
+            if (pi->second.link == link) failPendingLocked(pi, ErrorCode::NoBackend, "worker disconnected");
+            pi = next;
+        }
+    };
     for (;;) {
         auto fr = ch.recvFrame();
-        if (!fr.ok()) { std::lock_guard<std::mutex> l(mtx_); workers_.erase(env.workerId); workerChannels_.erase(env.workerId); return; }
+        if (!fr.ok()) { detach(); return; }
         ProtoFrame f = *fr;
         if (f.type == MsgType::Shutdown) break;
-        if (f.type == MsgType::Heartbeat) { ProtoFrame hb; hb.type = MsgType::Heartbeat; ch.sendFrame(hb); continue; }
+        if (f.type == MsgType::Heartbeat) {
+            ProtoFrame hb; hb.type = MsgType::Heartbeat;
+            std::lock_guard<std::mutex> sl(link->sendMutex);
+            ch.sendFrame(hb);
+            continue;
+        }
         if (f.type != MsgType::CompileResult) continue;
         if (f.payload.size() < kEnvSize) continue;
         ProtoEnvelope env2 = readEnv(f.payload.data(), f.payload.size());
-        if (rejectStalePublication(env2, "worker-result")) continue;
+        const std::string attemptKey = env2.attemptId.toHex();
+        // A connection only completes compiles that were dispatched to it.
+        {
+            std::lock_guard<std::mutex> l(mtx_);
+            auto pi = pending_.find(attemptKey);
+            if (pi == pending_.end() || pi->second.link != link || env2.workerId != env.workerId) {
+                rejectedStale_.fetch_add(1);
+                continue;
+            }
+        }
         bool success = false;
         Json resultJson = decodeCompileResult(f.payload, success);
-        if (!success) continue;
-        std::string keyStr = env2.requestId.toHex();
-        std::string pubKey = keyStr;
-        { std::lock_guard<std::mutex> l(mtx_); auto ki = reqToKey_.find(keyStr); if (ki != reqToKey_.end()) pubKey = ki->second; }
+        if (!success) {
+            // A failed compile answers its requester.
+            std::lock_guard<std::mutex> l(mtx_);
+            auto pi = pending_.find(attemptKey);
+            if (pi != pending_.end()) failPendingLocked(pi, ErrorCode::BuildFailed, "worker reported a failed compile");
+            continue;
+        }
+        if (rejectStalePublication(env2, "worker-result")) {
+            // A stale completion is not published, but its requester is answered.
+            std::lock_guard<std::mutex> l(mtx_);
+            auto pi = pending_.find(attemptKey);
+            if (pi != pending_.end() && pi->second.link == link)
+                failPendingLocked(pi, env2.epoch != epoch_.load() ? ErrorCode::StaleEpoch : ErrorCode::StaleGeneration,
+                                  "stale completion rejected");
+            continue;
+        }
         completed_.fetch_add(1);
         {
             std::lock_guard<std::mutex> l(mtx_);
-            published_[pubKey] = resultJson;
+            auto pi = pending_.find(attemptKey);
+            if (pi == pending_.end()) { duplicateSuppressed_.fetch_add(1); continue; }
+            published_[pi->second.keyHex] = resultJson;
             auto gi = artifactGen_.find(env2.artifactId.toHex());
             if (gi == artifactGen_.end() || env2.artifactGen > gi->second) artifactGen_[env2.artifactId.toHex()] = env2.artifactGen;
-            auto pi = pending_.find(keyStr);
-            if (pi != pending_.end() && pi->second) { pi->second->set_value(resultFromJson(resultJson)); pending_.erase(pi); }
-            else duplicateSuppressed_.fetch_add(1);
+            pi->second.promise->set_value(resultFromJson(resultJson));
+            pending_.erase(pi);
         }
     }
+    detach();
 }
 
 void DistributedCoordinator::handleClient(FramedChannel& ch, const ProtoFrame& firstFrame) {
@@ -240,7 +294,10 @@ void DistributedCoordinator::handleClientFrame(FramedChannel& ch, const ProtoFra
     if (f.type != MsgType::Submit && f.type != MsgType::Invalidate) return;
     ProtoEnvelope env = readEnv(f.payload.data(), f.payload.size());
     if (f.type == MsgType::Invalidate) {
-        std::lock_guard<std::mutex> l(mtx_); published_.erase(env.requestId.toHex());
+        std::lock_guard<std::mutex> l(mtx_);
+        // Published results are keyed by compilation key, not request id.
+        if (auto ki = reqToKey_.find(env.requestId.toHex()); ki != reqToKey_.end()) published_.erase(ki->second);
+        published_.erase(env.requestId.toHex());
         ProtoFrame ack; ack.type = MsgType::Reject; ack.payload = encodeReject(env, ErrorCode::Ok, "invalidated"); ch.sendFrame(ack);
         return;
     }
@@ -267,6 +324,13 @@ void DistributedCoordinator::handleClientFrame(FramedChannel& ch, const ProtoFra
     }
     WorkerId selected = 0; bool haveWorker = false;
     bool wantCuda = (plan.backend == "cuda-nvrtc");
+    // Pending compiles are keyed by a coordinator-assigned attempt id (client
+    // request ids are only unique per client) and bound to the connection they
+    // are dispatched to.
+    auto promise = std::make_shared<std::promise<CompilationResult>>();
+    std::shared_ptr<WorkerLink> link;
+    ProtoEnvelope env2;
+    std::string attemptKey;
     {
         std::lock_guard<std::mutex> l(mtx_);
         for (auto& [wid, caps] : workers_) {
@@ -274,18 +338,29 @@ void DistributedCoordinator::handleClientFrame(FramedChannel& ch, const ProtoFra
             if (wantCuda) { if (bk == "cuda-nvrtc") { selected = wid; haveWorker = true; break; } }
             else { if (bk == "cpu") { selected = wid; haveWorker = true; break; } }
         }
+        if (haveWorker) { auto wi = workerChannels_.find(selected); if (wi != workerChannels_.end()) link = wi->second; }
+        if (link) {
+            env2.epoch = epoch_.load(); env2.workerId = selected; env2.cacheGen = cacheGen_.load(); env2.toolchainGen = toolchainGen_.load();
+            env2.requestId = req.requestId; env2.attemptId = CompilationAttemptId::fromU64(dispatched_.fetch_add(1) + 1);
+            attemptKey = env2.attemptId.toHex();
+            pending_[attemptKey] = PendingCompile{promise, link, env2, keyHexStr};
+        }
     }
     if (!haveWorker) { ProtoEnvelope e; e.requestId = req.requestId; ProtoFrame rej; rej.type = MsgType::Reject; rej.payload = encodeReject(e, ErrorCode::NoBackend, "no capable worker"); ch.sendFrame(rej); return; }
-    auto promise = std::make_shared<std::promise<CompilationResult>>();
-    std::string reqKey = req.requestId.toHex();
-    { std::lock_guard<std::mutex> l(mtx_); pending_[reqKey] = promise; }
-    ProtoEnvelope env2; env2.epoch = epoch_.load(); env2.workerId = selected; env2.cacheGen = cacheGen_.load(); env2.toolchainGen = toolchainGen_.load();
-    env2.requestId = req.requestId; env2.attemptId = CompilationAttemptId::fromU64(dispatched_.fetch_add(1) + 1);
-    FramedChannel* wch = nullptr;
-    { std::lock_guard<std::mutex> l(mtx_); auto wi = workerChannels_.find(selected); if (wi != workerChannels_.end()) wch = wi->second; }
-    if (!wch) { std::lock_guard<std::mutex> l(mtx_); pending_.erase(reqKey); ProtoFrame rej; rej.type = MsgType::Reject; rej.payload = encodeReject(env2, ErrorCode::NoBackend, "worker gone"); ch.sendFrame(rej); return; }
+    if (!link) { ProtoEnvelope e; e.requestId = req.requestId; ProtoFrame rej; rej.type = MsgType::Reject; rej.payload = encodeReject(e, ErrorCode::NoBackend, "worker gone"); ch.sendFrame(rej); return; }
     ProtoFrame disp; disp.type = MsgType::DispatchCompile; disp.payload = encodeDispatch(env2, req, key);
-    if (!wch->sendFrame(disp).ok()) { std::lock_guard<std::mutex> l(mtx_); pending_.erase(reqKey); ProtoFrame rej; rej.type = MsgType::Reject; rej.payload = encodeReject(env2, ErrorCode::IOError, "dispatch failed"); ch.sendFrame(rej); return; }
+    bool sent = false;
+    {
+        // Serialized with every other send on this worker's channel, and never
+        // after its handler marked it dead (the channel is about to go away).
+        std::lock_guard<std::mutex> sl(link->sendMutex);
+        sent = link->alive && link->channel->sendFrame(disp).ok();
+    }
+    if (!sent) {
+        std::lock_guard<std::mutex> l(mtx_);
+        auto pi = pending_.find(attemptKey);
+        if (pi != pending_.end()) failPendingLocked(pi, ErrorCode::IOError, "dispatch failed");
+    }
     auto fut = promise->get_future();
     CompilationResult res = fut.get();
     ProtoEnvelope rEnv; rEnv.requestId = req.requestId;

@@ -74,6 +74,19 @@ struct CompilationFabric::Impl {
 
     mutable std::mutex persistMutex_;
     mutable std::mutex leaseMutex_;
+
+    // Re-persist an entry's current descriptor with its invalidated/superseded
+    // state, so a restart does not recover it as a reusable artifact. The
+    // caller holds regMutex_.
+    void persistState(const CacheEntry& e, bool invalidated, bool superseded) {
+        if (!config.persistenceEnabled) return;
+        PersistedRecord rec;
+        rec.id = e.descriptor.id; rec.generation = e.descriptor.generation; rec.key = e.key;
+        rec.descriptor = e.descriptor; rec.contentBytes = e.bytes;
+        rec.invalidated = invalidated; rec.superseded = superseded;
+        std::lock_guard<std::mutex> pl(persistMutex_);
+        if (!store->store(rec).ok()) obs.count("persistence_failures");
+    }
 };
 
 CompilationFabric::CompilationFabric(CompilationFabricConfig config) : impl_(std::make_unique<Impl>()), config_(config) {
@@ -272,6 +285,19 @@ Result<CompilationResult> CompilationFabric::compile(const CompilationRequest& r
         i.inflight[key] = e;
         owned = e;
     }
+    // Resolve the single-flight entry on every exit, including a throwing
+    // backend, so waiters never block forever and the key is never wedged.
+    struct OwnerGuard {
+        Impl& impl;
+        std::shared_ptr<Impl::InflightEntry>& entry;
+        ~OwnerGuard() {
+            std::lock_guard<std::mutex> gl(impl.regMutex_);
+            if (!entry->done) {
+                entry->done = true; entry->success = false; entry->failure = ErrorCode::BuildFailed;
+                entry->failureMsg = "compilation aborted by an exception"; entry->cv.notify_all();
+            }
+        }
+    } ownerGuard{i, owned};
 
     // Owner compiles OUTSIDE any lock.
     auto backendIt = i.backends.find(plan.backend);
@@ -455,7 +481,7 @@ Result<void> CompilationFabric::invalidateByKey(const CompilationKey& key) {
     auto& i = *impl_;
     std::lock_guard<std::mutex> l(i.regMutex_);
     auto it = i.cache.find(key);
-    if (it != i.cache.end()) { it->second.descriptor.state = "Invalidated"; it->second.descriptor.deployment.deployable = false; it->second.descriptor.validation.passed = false; }
+    if (it != i.cache.end()) { it->second.descriptor.state = "Invalidated"; it->second.descriptor.deployment.deployable = false; it->second.descriptor.validation.passed = false; i.persistState(it->second, true, false); }
     i.cacheGen += 1; i.obs.set("cache_generation", static_cast<int64_t>(i.cacheGen));
     i.obs.count("invalidations");
     i.obs.recordEvent("invalidate", Json::object({{"key", Json::str(key.toHex())}}));
@@ -464,7 +490,7 @@ Result<void> CompilationFabric::invalidateByKey(const CompilationKey& key) {
 Result<void> CompilationFabric::invalidateById(const ArtifactId& id) {
     auto& i = *impl_;
     std::lock_guard<std::mutex> l(i.regMutex_);
-    for (auto& [k, e] : i.cache) if (e.descriptor.id == id) { e.descriptor.state = "Invalidated"; e.descriptor.deployment.deployable = false; e.descriptor.validation.passed = false; }
+    for (auto& [k, e] : i.cache) if (e.descriptor.id == id) { e.descriptor.state = "Invalidated"; e.descriptor.deployment.deployable = false; e.descriptor.validation.passed = false; i.persistState(e, true, false); }
     i.cacheGen += 1; i.obs.set("cache_generation", static_cast<int64_t>(i.cacheGen));
     i.obs.count("invalidations");
     return OkVoid();
@@ -472,7 +498,7 @@ Result<void> CompilationFabric::invalidateById(const ArtifactId& id) {
 Result<void> CompilationFabric::invalidateByLogicalOperation(const LogicalOperation& op) {
     auto& i = *impl_;
     std::lock_guard<std::mutex> l(i.regMutex_);
-    for (auto& [k, e] : i.cache) if (e.key.logicalOperation() && *e.key.logicalOperation() == op) { e.descriptor.state = "Invalidated"; e.descriptor.deployment.deployable = false; e.descriptor.validation.passed = false; }
+    for (auto& [k, e] : i.cache) if (e.key.logicalOperation() && *e.key.logicalOperation() == op) { e.descriptor.state = "Invalidated"; e.descriptor.deployment.deployable = false; e.descriptor.validation.passed = false; i.persistState(e, true, false); }
     i.cacheGen += 1; i.obs.set("cache_generation", static_cast<int64_t>(i.cacheGen));
     i.obs.count("invalidations");
     return OkVoid();
@@ -480,7 +506,7 @@ Result<void> CompilationFabric::invalidateByLogicalOperation(const LogicalOperat
 Result<void> CompilationFabric::invalidateByCompilerGeneration(uint64_t gen) {
     auto& i = *impl_;
     std::lock_guard<std::mutex> l(i.regMutex_);
-    for (auto& [k, e] : i.cache) if (e.baseToolchainGen <= gen) { e.descriptor.state = "Invalidated"; e.descriptor.deployment.deployable = false; e.descriptor.validation.passed = false; }
+    for (auto& [k, e] : i.cache) if (e.baseToolchainGen <= gen) { e.descriptor.state = "Invalidated"; e.descriptor.deployment.deployable = false; e.descriptor.validation.passed = false; i.persistState(e, true, false); }
     i.toolchainGen += 1; i.cacheGen += 1; i.obs.set("cache_generation", static_cast<int64_t>(i.cacheGen));
     i.obs.count("invalidations");
     return OkVoid();
@@ -490,7 +516,7 @@ Result<void> CompilationFabric::invalidateByDependencyGeneration(uint64_t gen) {
     std::lock_guard<std::mutex> l(i.regMutex_);
     for (auto& [k, e] : i.cache) {
         auto dg = e.key.u64Field(KeyField::DependencyGenerations);
-        if (dg && *dg <= gen) { e.descriptor.state = "Invalidated"; e.descriptor.deployment.deployable = false; e.descriptor.validation.passed = false; }
+        if (dg && *dg <= gen) { e.descriptor.state = "Invalidated"; e.descriptor.deployment.deployable = false; e.descriptor.validation.passed = false; i.persistState(e, true, false); }
     }
     i.cacheGen += 1; i.obs.set("cache_generation", static_cast<int64_t>(i.cacheGen));
     i.obs.count("invalidations");
@@ -500,7 +526,7 @@ Result<void> CompilationFabric::supersede(const ArtifactId& id, ArtifactGenerati
     auto& i = *impl_;
     std::lock_guard<std::mutex> l(i.regMutex_);
     for (auto& [k, e] : i.cache) {
-        if (e.descriptor.id == id && e.descriptor.generation < newGen) { e.descriptor.state = "Superseded"; e.descriptor.deployment.deployable = false; }
+        if (e.descriptor.id == id && e.descriptor.generation < newGen) { e.descriptor.state = "Superseded"; e.descriptor.deployment.deployable = false; i.persistState(e, false, true); }
     }
     i.obs.count("supersessions");
     return OkVoid();
@@ -565,6 +591,18 @@ Result<void> CompilationFabric::recover() {
     if (!rec.ok()) return ErrVoid(rec.code(), rec.message());
     auto& res = *rec;
     std::lock_guard<std::mutex> l(i.regMutex_);
+    // Artifact ids, attempt ids and generations come from one counter. A
+    // recovered runtime must never hand out a value a persisted artifact
+    // already holds (the new artifact would share its identity and file).
+    uint64_t maxSeen = 0;
+    auto see = [&](const ArtifactId& id, ArtifactGeneration gen) {
+        maxSeen = (std::max)(maxSeen, (std::max)(gen, id.raw().lo));
+    };
+    for (auto& r : res.valid) see(r.id, r.generation);
+    for (auto& r : res.invalidated) see(r.id, r.generation);
+    for (auto& r : res.corrupted) see(r.id, r.generation);
+    uint64_t cur = i.artifactCounter.load();
+    while (cur < maxSeen && !i.artifactCounter.compare_exchange_weak(cur, maxSeen)) {}
     for (auto& r : res.valid) {
         if (r.invalidated || r.superseded) { /* keep state */ }
         Impl::CacheEntry ce; ce.key = r.key; ce.descriptor = r.descriptor; ce.bytes = r.contentBytes;

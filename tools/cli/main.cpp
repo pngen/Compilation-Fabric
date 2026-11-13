@@ -48,9 +48,9 @@ static CompilationRequest loadRequest(const std::string& path) {
 }
 
 static std::string cliRoot() {
+    // A fresh per-invocation directory under the temp directory. Nothing is
+    // removed: the parent of this path is the user's whole temp directory.
     std::filesystem::path p = std::filesystem::temp_directory_path() / ("cf_cli_" + std::to_string(Clock::monotonicNanos()));
-    std::error_code ec;
-    std::filesystem::remove_all(p.parent_path(), ec);
     return p.string();
 }
 

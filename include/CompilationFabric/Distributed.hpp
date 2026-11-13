@@ -63,6 +63,23 @@ private:
     bool rejectStalePublication(const ProtoEnvelope& env, const std::string& context);
     void dispatchToWorker(CompilationResult& out, const CompilationRequest& req, const CompilationKey& key);
 
+    // A registered worker connection. Sends are serialized on it, and its
+    // handler marks it dead before its channel goes away.
+    struct WorkerLink {
+        FramedChannel* channel = nullptr;
+        std::mutex sendMutex;
+        bool alive = true;
+    };
+    // A dispatched compile, keyed by its coordinator-assigned attempt id.
+    struct PendingCompile {
+        std::shared_ptr<std::promise<CompilationResult>> promise;
+        std::shared_ptr<WorkerLink> link;   // the connection it was dispatched to
+        ProtoEnvelope dispatch;             // the authority it was dispatched under
+        std::string keyHex;                 // published under this compilation key
+    };
+    // Resolve a pending compile with an error. Caller holds mtx_.
+    void failPendingLocked(std::map<std::string, PendingCompile>::iterator it, ErrorCode code, const std::string& msg);
+
     uint16_t port_;
     std::string root_;
     std::atomic<CoordinatorEpoch> epoch_;
@@ -70,9 +87,9 @@ private:
     std::atomic<ToolchainGeneration> toolchainGen_;
     mutable std::mutex mtx_;
     std::map<WorkerId, Json> workers_;
-    std::map<WorkerId, FramedChannel*> workerChannels_;
+    std::map<WorkerId, std::shared_ptr<WorkerLink>> workerChannels_;
     std::map<std::string, CompilationAttemptId> inflight_;
-    std::map<std::string, std::shared_ptr<std::promise<CompilationResult>>> pending_;
+    std::map<std::string, PendingCompile> pending_;   // attempt id hex -> dispatched compile
     std::map<std::string, std::string> reqToKey_;
     std::map<std::string, Json> published_;
     std::map<std::string, ArtifactGeneration> artifactGen_;
